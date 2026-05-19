@@ -9,6 +9,7 @@ import math
 import os
 import warnings
 import torch
+import torch.nn.functional as F
 from typing import Optional, Union
 import triton.language as tl
 
@@ -109,6 +110,18 @@ def _run_attention(
     """
     B, H, N, D = q.shape
     original_seq_len = N
+
+    # Pad sequence to a multiple of tile_size so that every Triton tile is full.
+    # Without this, the last partial tile computes out-of-bounds pointers (even
+    # for masked lanes), which causes cudaErrorIllegalAddress on Blackwell (SM 10.0)
+    # and is undefined behaviour on other architectures.
+    tile_size = max(tile_size_q, tile_size_k)
+    if N % tile_size != 0:
+        pad_len = tile_size - (N % tile_size)
+        q = F.pad(q, (0, 0, 0, pad_len))
+        k = F.pad(k, (0, 0, 0, pad_len))
+        v = F.pad(v, (0, 0, 0, pad_len))
+        B, H, N, D = q.shape  # update N to padded length
 
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(D)
