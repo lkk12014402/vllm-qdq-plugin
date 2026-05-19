@@ -111,6 +111,39 @@ def _run_attention(
     B, H, N, D = q.shape
     original_seq_len = N
 
+    # ── Hardware MXFP8 early dispatch (uses tl.dot_scaled, no host-side quant) ──
+    if config.name == "mxfp8_hw":
+        from .mxfp8_hw_kernel import mxfp8_flash_attention, quantize_to_mxfp8
+
+        # Pad sequence to BLOCK_M=128
+        if N % 128 != 0:
+            pad_len = 128 - (N % 128)
+            q = F.pad(q, (0, 0, 0, pad_len))
+            k = F.pad(k, (0, 0, 0, pad_len))
+            v = F.pad(v, (0, 0, 0, pad_len))
+            B, H, N, D = q.shape
+
+        if sm_scale is None:
+            sm_scale = 1.0 / math.sqrt(D)
+
+        # Quantize Q, K to MXFP8 (groups along HEAD_DIM)
+        q_fp8, q_scale = quantize_to_mxfp8(q)
+        k_fp8, k_scale = quantize_to_mxfp8(k)
+        # V needs grouping along seq dim: permute to [B,H,D,N], quantize, permute back
+        v_t = v.permute(0, 1, 3, 2).contiguous()  # [B,H,D,N]
+        v_fp8_t, v_scale = quantize_to_mxfp8(v_t)  # v_scale: [B,H,D,N//32]
+        v_fp8 = v_fp8_t.permute(0, 1, 3, 2).contiguous()  # [B,H,N,D]
+
+        output = mxfp8_flash_attention(
+            q_fp8, k_fp8, v_fp8,
+            q_scale, k_scale, v_scale,
+            causal=is_causal, sm_scale=sm_scale,
+        )
+
+        if output.size(2) != original_seq_len:
+            output = output[:, :, :original_seq_len, :].contiguous()
+        return output.to(q.dtype)
+
     # Pad sequence to a multiple of tile_size so that every Triton tile is full.
     # Without this, the last partial tile computes out-of-bounds pointers (even
     # for masked lanes), which causes cudaErrorIllegalAddress on Blackwell (SM 10.0)

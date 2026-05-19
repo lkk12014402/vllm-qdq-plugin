@@ -309,8 +309,20 @@ def _register_builtin_configs():
         pre_transforms=(qk_smoothing, v_smoothing),
     )
 
-    # Validate all configs at registration time
+    # Hardware MXFP8 — uses tl.dot_scaled directly, no host-side quantize path
+    # Skips validate() since qk_quant/pv_quant/p_quant_fn are None (handled in kernel)
+    ATTENTION_CONFIGS["mxfp8_hw"] = AttentionConfig(
+        name="mxfp8_hw",
+        qk_quant=None,
+        pv_quant=None,
+        p_quant_fn=None,
+        pre_transforms=(),
+    )
+
+    # Validate all configs at registration time (skip mxfp8_hw)
     for config in ATTENTION_CONFIGS.values():
+        if config.name == "mxfp8_hw":
+            continue
         config.validate()
 
 
