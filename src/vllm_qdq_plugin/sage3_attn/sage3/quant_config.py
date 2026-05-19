@@ -319,9 +319,18 @@ def _register_builtin_configs():
         pre_transforms=(),
     )
 
-    # Validate all configs at registration time (skip mxfp8_hw)
+    # Hardware MXFP4 — uses tl.dot_scaled e2m1 directly, no host-side quantize path
+    ATTENTION_CONFIGS["mxfp4_hw"] = AttentionConfig(
+        name="mxfp4_hw",
+        qk_quant=None,
+        pv_quant=None,
+        p_quant_fn=None,
+        pre_transforms=(),
+    )
+
+    # Validate all configs at registration time (skip hardware MX configs)
     for config in ATTENTION_CONFIGS.values():
-        if config.name == "mxfp8_hw":
+        if config.name in ("mxfp8_hw", "mxfp4_hw"):
             continue
         config.validate()
 

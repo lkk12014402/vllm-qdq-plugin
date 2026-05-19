@@ -144,6 +144,41 @@ def _run_attention(
             output = output[:, :, :original_seq_len, :].contiguous()
         return output.to(q.dtype)
 
+    # ── Hardware MXFP4 early dispatch (uses tl.dot_scaled e2m1) ──
+    if config.name == "mxfp4_hw":
+        from .mxfp4_hw_kernel import mxfp4_flash_attention, quantize_to_mxfp4
+
+        # Pad sequence to BLOCK_M=128
+        if N % 128 != 0:
+            pad_len = 128 - (N % 128)
+            q = F.pad(q, (0, 0, 0, pad_len))
+            k = F.pad(k, (0, 0, 0, pad_len))
+            v = F.pad(v, (0, 0, 0, pad_len))
+            B, H, N, D = q.shape
+
+        if sm_scale is None:
+            sm_scale = 1.0 / math.sqrt(D)
+
+        # Quantize Q, K to MXFP4 (packed along HEAD_DIM) -> [B,H,N,D//2] uint8
+        q_packed, q_scale = quantize_to_mxfp4(q)
+        k_packed, k_scale = quantize_to_mxfp4(k)
+        # V needs packing along seq dim: permute to [B,H,D,N], quantize, get [B,H,D,N//2]
+        v_t = v.permute(0, 1, 3, 2).contiguous()  # [B,H,D,N]
+        v_flat = v_t.reshape(-1, N)
+        v_packed_flat, v_scale_flat = quantize_to_mxfp4(v_flat)
+        v_packed = v_packed_flat.reshape(B, H, D, N // 2)  # [B,H,D,N//2]
+        v_scale = v_scale_flat.reshape(B, H, D, N // 32)  # [B,H,D,N//32]
+
+        output = mxfp4_flash_attention(
+            q_packed, k_packed, v_packed,
+            q_scale, k_scale, v_scale,
+            causal=is_causal, sm_scale=sm_scale,
+        )
+
+        if output.size(2) != original_seq_len:
+            output = output[:, :, :original_seq_len, :].contiguous()
+        return output.to(q.dtype)
+
     # Pad sequence to a multiple of tile_size so that every Triton tile is full.
     # Without this, the last partial tile computes out-of-bounds pointers (even
     # for masked lanes), which causes cudaErrorIllegalAddress on Blackwell (SM 10.0)
