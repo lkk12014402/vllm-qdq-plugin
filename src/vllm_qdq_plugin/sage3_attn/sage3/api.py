@@ -114,6 +114,7 @@ def _run_attention(
     # ── Hardware MXFP8 early dispatch (uses tl.dot_scaled, no host-side quant) ──
     if config.name == "mxfp8_hw":
         from .mxfp8_hw_kernel import mxfp8_flash_attention, quantize_to_mxfp8
+        print_once(f"[SAGE3 TRACE] mxfp8_hw kernel dispatched: Q={q.shape}, K={k.shape}, V={v.shape}, D={D}")
 
         # Pad sequence to BLOCK_M=128
         if N % 128 != 0:
@@ -147,6 +148,7 @@ def _run_attention(
     # ── Hardware MXFP4 early dispatch (uses tl.dot_scaled e2m1) ──
     if config.name == "mxfp4_hw":
         from .mxfp4_hw_kernel import mxfp4_flash_attention, quantize_to_mxfp4
+        print_once(f"[SAGE3 TRACE] mxfp4_hw kernel dispatched: Q={q.shape}, K={k.shape}, V={v.shape}, D={D}")
 
         # Pad sequence to BLOCK_M=128
         if N % 128 != 0:
@@ -171,6 +173,47 @@ def _run_attention(
 
         output = mxfp4_flash_attention(
             q_packed, k_packed, v_packed,
+            q_scale, k_scale, v_scale,
+            causal=is_causal, sm_scale=sm_scale,
+        )
+
+        if output.size(2) != original_seq_len:
+            output = output[:, :, :original_seq_len, :].contiguous()
+        return output.to(q.dtype)
+
+    # ── Mixed MXFP8 QK + MXFP4 PV early dispatch ──
+    if config.name == "mixed_mxfp8qk_mxfp4pv_hw":
+        from .mixed_mxfp8qk_mxfp4pv_hw_kernel import (
+            mixed_mxfp8qk_mxfp4pv_flash_attention,
+            quantize_to_mxfp8,
+            quantize_to_mxfp4,
+        )
+        print_once(f"[SAGE3 TRACE] mixed_mxfp8qk_mxfp4pv_hw kernel dispatched: Q={q.shape}, K={k.shape}, V={v.shape}, D={D}")
+
+        # Pad sequence to BLOCK_M=128
+        if N % 128 != 0:
+            pad_len = 128 - (N % 128)
+            q = F.pad(q, (0, 0, 0, pad_len))
+            k = F.pad(k, (0, 0, 0, pad_len))
+            v = F.pad(v, (0, 0, 0, pad_len))
+            B, H, N, D = q.shape
+
+        if sm_scale is None:
+            sm_scale = 1.0 / math.sqrt(D)
+
+        # Quantize Q, K to MXFP8 (groups along HEAD_DIM)
+        q_fp8, q_scale = quantize_to_mxfp8(q)
+        k_fp8, k_scale = quantize_to_mxfp8(k)
+
+        # Quantize V to MXFP4 (along sequence dim N, col-major)
+        v_t = v.permute(0, 1, 3, 2).contiguous()  # [B,H,D,N]
+        v_flat = v_t.reshape(-1, N)
+        v_packed_flat, v_scale_flat = quantize_to_mxfp4(v_flat)
+        v_packed = v_packed_flat.reshape(B, H, D, N // 2)  # [B,H,D,N//2]
+        v_scale = v_scale_flat.reshape(B, H, D, N // 32)  # [B,H,D,N//32]
+
+        output = mixed_mxfp8qk_mxfp4pv_flash_attention(
+            q_fp8, k_fp8, v_packed,
             q_scale, k_scale, v_scale,
             causal=is_causal, sm_scale=sm_scale,
         )
