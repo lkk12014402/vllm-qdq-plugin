@@ -337,9 +337,18 @@ def _register_builtin_configs():
         pre_transforms=(),
     )
 
+    # Mixed MXFP4 QK + MXFP8 PV — uses tl.dot_scaled with e2m1 for QK and e4m3 for PV
+    ATTENTION_CONFIGS["mixed_mxfp4qk_mxfp8pv_hw"] = AttentionConfig(
+        name="mixed_mxfp4qk_mxfp8pv_hw",
+        qk_quant=None,
+        pv_quant=None,
+        p_quant_fn=None,
+        pre_transforms=(),
+    )
+
     # Validate all configs at registration time (skip hardware MX configs)
     for config in ATTENTION_CONFIGS.values():
-        if config.name in ("mxfp8_hw", "mxfp4_hw", "mixed_mxfp8qk_mxfp4pv_hw"):
+        if config.name in ("mxfp8_hw", "mxfp4_hw", "mixed_mxfp8qk_mxfp4pv_hw", "mixed_mxfp4qk_mxfp8pv_hw"):
             continue
         config.validate()
 

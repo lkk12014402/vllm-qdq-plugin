@@ -166,10 +166,12 @@ def _fp32x2_to_fp4x2(x_lo, x_hi):
 def _mxfp4_attn_fwd_inner(
     acc, l_i, m_i, q, q_scale,  #
     K_ptr, K_scale_ptr, V_ptr, V_scale_ptr,  #
+    Delta_s_ptr,  #
     stride_kn, stride_kk,  #
     stride_ks_n, stride_ks_k,  #
     stride_vd, stride_vn,  #
     stride_vs_d, stride_vs_n,  #
+    stride_delta_g, stride_delta_n,  #
     start_m, qk_scale,  #
     offs_m, offs_n,  #
     N_CTX: tl.constexpr,  #
@@ -177,6 +179,7 @@ def _mxfp4_attn_fwd_inner(
     HEAD_DIM: tl.constexpr,  #
     BLOCK_N: tl.constexpr,  #
     STAGE: tl.constexpr,  #
+    HAS_DELTA_S: tl.constexpr,  #
 ):
     # Determine loop bounds based on causal stage
     if STAGE == 1:
@@ -212,6 +215,13 @@ def _mxfp4_attn_fwd_inner(
         # lhs=q [BLOCK_M, HEAD_DIM//2] packed, lhs_scale=q_scale [BLOCK_M, HEAD_DIM//32]
         # rhs=k.T [HEAD_DIM//2, BLOCK_N] packed, rhs_scale=k_scale [BLOCK_N, HEAD_DIM//32]
         qk = tl.dot_scaled(q, q_scale, "e2m1", tl.trans(k), k_scale, "e2m1")
+
+        # -- Add delta_s correction (before scaling) --
+        if HAS_DELTA_S:
+            group_id = start_m  # BLOCK_M=128 = GROUP_SIZE
+            ds_ptrs = Delta_s_ptr + group_id * stride_delta_g + (start_n + offs_n) * stride_delta_n
+            ds_tile = tl.load(ds_ptrs)  # [BLOCK_N]
+            qk = qk + ds_tile[None, :]
 
         # -- Online softmax --
         if STAGE == 2:
@@ -282,6 +292,7 @@ def _mxfp4_attn_fwd_inner(
 def _mxfp4_attn_fwd(
     Q, K, V, Out,  #
     Q_scale, K_scale, V_scale,  #
+    Delta_s,  #
     sm_scale,  #
     stride_qz, stride_qh, stride_qm, stride_qk,  #
     stride_kz, stride_kh, stride_kn, stride_kk,  #
@@ -290,11 +301,13 @@ def _mxfp4_attn_fwd(
     stride_qsz, stride_qsh, stride_qsm, stride_qsk,  #
     stride_ksz, stride_ksh, stride_ksn, stride_ksk,  #
     stride_vsz, stride_vsh, stride_vsd, stride_vsn,  #
+    stride_dsz, stride_dsh, stride_dsg, stride_dsn,  #
     Z, H, N_CTX,  #
     HEAD_DIM: tl.constexpr,  #
     BLOCK_M: tl.constexpr,  #
     BLOCK_N: tl.constexpr,  #
     STAGE: tl.constexpr,  #
+    HAS_DELTA_S: tl.constexpr,  #
 ):
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
@@ -316,6 +329,9 @@ def _mxfp4_attn_fwd(
     Q_scale_ptr = Q_scale + qs_offset
     K_scale_ptr = K_scale + ks_offset
     V_scale_ptr = V_scale + vs_offset
+
+    # Delta_s pointer for this batch/head
+    Delta_s_ptr = Delta_s + off_z * stride_dsz + off_h * stride_dsh
 
     HEAD_DIM_PACKED: tl.constexpr = HEAD_DIM // 2
 
@@ -345,27 +361,33 @@ def _mxfp4_attn_fwd(
         acc, l_i, m_i = _mxfp4_attn_fwd_inner(
             acc, l_i, m_i, q, q_scale,
             K_ptr, K_scale_ptr, V_ptr, V_scale_ptr,
+            Delta_s_ptr,
             stride_kn, stride_kk,
             stride_ksn, stride_ksk,
             stride_vd, stride_vn,
             stride_vsd, stride_vsn,
+            stride_dsg, stride_dsn,
             start_m, qk_scale,
             offs_m, offs_n,
             N_CTX, BLOCK_M, HEAD_DIM, BLOCK_N,
             4 - STAGE,
+            HAS_DELTA_S,
         )
     if STAGE & 2:
         acc, l_i, m_i = _mxfp4_attn_fwd_inner(
             acc, l_i, m_i, q, q_scale,
             K_ptr, K_scale_ptr, V_ptr, V_scale_ptr,
+            Delta_s_ptr,
             stride_kn, stride_kk,
             stride_ksn, stride_ksk,
             stride_vd, stride_vn,
             stride_vsd, stride_vsn,
+            stride_dsg, stride_dsn,
             start_m, qk_scale,
             offs_m, offs_n,
             N_CTX, BLOCK_M, HEAD_DIM, BLOCK_N,
             2,
+            HAS_DELTA_S,
         )
 
     # Normalize output
@@ -391,6 +413,7 @@ def mxfp4_flash_attention(
     v_scale: torch.Tensor,
     causal: bool = False,
     sm_scale: float = None,
+    delta_s: torch.Tensor = None,
 ) -> torch.Tensor:
     """
     MXFP4 (E2M1) Flash Attention forward pass with E8M0 block scales.
@@ -404,6 +427,7 @@ def mxfp4_flash_attention(
         v_scale: [B, H, D, N//32] uint8 — E8M0 scales for V
         causal: whether to apply causal mask
         sm_scale: softmax scale (default: 1/sqrt(HEAD_DIM))
+        delta_s: [B, H, num_groups, N] float32 — QK smoothing correction (optional)
 
     Returns:
         output: [B, H, M, D] float32
@@ -426,11 +450,17 @@ def mxfp4_flash_attention(
 
     STAGE = 3 if causal else 1
 
+    has_delta_s = delta_s is not None
+    if not has_delta_s:
+        # Dummy tensor — pointer won't be dereferenced when HAS_DELTA_S=False
+        delta_s = torch.zeros(1, 1, 1, 1, dtype=torch.float32, device=q_packed.device)
+
     grid = (triton.cdiv(M, BLOCK_M), B * H)
 
     _mxfp4_attn_fwd[grid](
         q_packed, k_packed, v_packed, output,
         q_scale, k_scale, v_scale,
+        delta_s,
         sm_scale,
         # Q strides [B, H, M, D//2]
         q_packed.stride(0), q_packed.stride(1), q_packed.stride(2), q_packed.stride(3),
@@ -446,6 +476,8 @@ def mxfp4_flash_attention(
         k_scale.stride(0), k_scale.stride(1), k_scale.stride(2), k_scale.stride(3),
         # V_scale strides [B, H, D, N//32]
         v_scale.stride(0), v_scale.stride(1), v_scale.stride(2), v_scale.stride(3),
+        # Delta_s strides [B, H, num_groups, N]
+        delta_s.stride(0), delta_s.stride(1), delta_s.stride(2), delta_s.stride(3),
         # Dimensions
         B, H, N,
         # Compile-time constants
@@ -453,6 +485,7 @@ def mxfp4_flash_attention(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         STAGE=STAGE,
+        HAS_DELTA_S=has_delta_s,
         num_warps=4,
         num_stages=4,
     )
