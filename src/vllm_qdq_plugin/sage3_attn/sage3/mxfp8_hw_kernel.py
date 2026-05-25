@@ -167,7 +167,8 @@ def _mxfp8_attn_fwd_inner(
         # For amax=0, use encoding 0 (smallest scale = 2^-127)
         # Normalize P by max representable E4M3 value (448.0) to utilize full range
         FP8_E4M3_MAX: tl.constexpr = 448.0
-        p_amax_safe = tl.maximum(p_amax / FP8_E4M3_MAX, 1e-12)
+        E8M0_MIN_SCALE: tl.constexpr = 5.877471754e-39  # 2^-127
+        p_amax_safe = tl.maximum(p_amax / FP8_E4M3_MAX, E8M0_MIN_SCALE)
         p_log2 = tl.math.ceil(tl.math.log2(p_amax_safe))
         # Clamp to valid E8M0 range [0, 254] (255 is reserved NaN)
         p_e8m0 = tl.minimum(tl.maximum(p_log2 + 127, 0.0), 254.0).to(tl.uint8)  # [BLOCK_M, BLOCK_N // 32]

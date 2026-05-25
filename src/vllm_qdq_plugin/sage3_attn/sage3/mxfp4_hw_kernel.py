@@ -247,8 +247,10 @@ def _mxfp4_attn_fwd_inner(
         p_amax = tl.max(p_reshaped, 2)  # [BLOCK_M, BLOCK_N // 32]
 
         # E8M0 scale computation
-        p_amax_safe = tl.maximum(p_amax, 6.0 * 5.877471754e-39)  # 6.0 * 2^-126
-        p_log2 = tl.math.ceil(tl.math.log2(p_amax_safe * 0.16666667))  # * (1/6)
+        FP4_E2M1_MAX: tl.constexpr = 6.0
+        E8M0_MIN_SCALE: tl.constexpr = 5.877471754e-39  # 2^-127
+        p_amax_safe = tl.maximum(p_amax, FP4_E2M1_MAX * E8M0_MIN_SCALE)
+        p_log2 = tl.math.ceil(tl.math.log2(p_amax_safe / FP4_E2M1_MAX))
         p_log2 = tl.minimum(tl.maximum(p_log2, -127.0), 127.0)
         p_e8m0 = (p_log2 + 127.0).to(tl.uint8)  # [BLOCK_M, BLOCK_N // 32]
         inv_scale = tl.math.exp2(-p_log2)
