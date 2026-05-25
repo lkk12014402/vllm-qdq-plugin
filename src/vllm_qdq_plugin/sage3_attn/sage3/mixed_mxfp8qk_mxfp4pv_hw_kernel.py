@@ -19,6 +19,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .triton_utils import compute_p_scale_inv
+
 # ============================================================================
 # Helper Functions
 # ============================================================================
@@ -209,19 +211,9 @@ def _mixed_attn_fwd_inner(
         p_reshaped = tl.reshape(p, [BLOCK_M, BLOCK_N // 32, 32])
         p_amax = tl.max(p_reshaped, 2)  # [BLOCK_M, BLOCK_N // 32]
 
-        # E8M0 scale computation
         FP4_E2M1_MAX: tl.constexpr = 6.0
-        E8M0_MIN_SCALE: tl.constexpr = 5.877471754e-39  # 2^-127
-        p_amax_safe = tl.maximum(p_amax, FP4_E2M1_MAX * E8M0_MIN_SCALE)
-        p_log2 = tl.math.ceil(tl.math.log2(p_amax_safe / FP4_E2M1_MAX))
-        p_log2 = tl.minimum(tl.maximum(p_log2, -127.0), 127.0)
-        p_e8m0 = (p_log2 + 127.0).to(tl.uint8)  # [BLOCK_M, BLOCK_N // 32]
-        inv_scale = tl.math.exp2(-p_log2)
-
-        # Expand inv_scale to [BLOCK_M, BLOCK_N]
-        inv_scale_expanded = tl.reshape(
-            tl.broadcast_to(inv_scale[:, :, None], [BLOCK_M, BLOCK_N // 32, 32]),
-            [BLOCK_M, BLOCK_N]
+        p_e8m0, inv_scale_expanded = compute_p_scale_inv(
+            p_amax, FP4_E2M1_MAX, BLOCK_M, BLOCK_N,
         )
 
         # Scale P values

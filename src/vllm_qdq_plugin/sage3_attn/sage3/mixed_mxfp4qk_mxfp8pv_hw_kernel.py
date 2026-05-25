@@ -19,6 +19,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .triton_utils import compute_p_scale_inv
+
 # ============================================================================
 # Helper Functions
 # ============================================================================
@@ -189,22 +191,11 @@ def _mixed_attn_fwd_inner(
         p_reshaped = tl.reshape(p, [BLOCK_M, BLOCK_N // 32, 32])
         p_amax = tl.max(p_reshaped, 2)  # [BLOCK_M, BLOCK_N // 32]
 
-        # E8M0 scale: encoding = ceil(log2(amax / 448)) + 127, clamped to [0, 254]
         FP8_E4M3_MAX: tl.constexpr = 448.0
-        E8M0_MIN_SCALE: tl.constexpr = 5.877471754e-39  # 2^-127
-        p_amax_safe = tl.maximum(p_amax / FP8_E4M3_MAX, E8M0_MIN_SCALE)
-        p_log2 = tl.math.ceil(tl.math.log2(p_amax_safe))
-        p_e8m0 = tl.minimum(tl.maximum(p_log2 + 127, 0.0), 254.0).to(tl.uint8)  # [BLOCK_M, BLOCK_N // 32]
-
-        # Compute float scale for quantizing P
-        p_scale_f32 = tl.math.exp2((p_e8m0.to(tl.float32) - 127.0))
-        # Expand scale to [BLOCK_M, BLOCK_N]
-        p_scale_expanded = tl.reshape(
-            tl.broadcast_to(p_scale_f32[:, :, None], [BLOCK_M, BLOCK_N // 32, 32]),
-            [BLOCK_M, BLOCK_N]
+        p_e8m0, inv_scale_expanded = compute_p_scale_inv(
+            p_amax, FP8_E4M3_MAX, BLOCK_M, BLOCK_N,
         )
-        # Quantize P to fp8
-        p_scaled = p / p_scale_expanded
+        p_scaled = tl.minimum(p * inv_scale_expanded, FP8_E4M3_MAX)
         p_fp8 = p_scaled.to(tl.float8e4nv)
         p_scale = p_e8m0  # [BLOCK_M, BLOCK_N // 32]
 
