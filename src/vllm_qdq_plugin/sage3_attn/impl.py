@@ -6,6 +6,7 @@ Imports the sage3 standalone kernel and wraps it with:
 - Cross-attention fallback to torch SDPA (different Q/K seq lengths)
 """
 
+import os
 import torch
 import torch.nn.functional as F
 
@@ -61,7 +62,28 @@ class Sage3TritonImpl(AttentionImpl):
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
         # Input layout: NHD = [B, N, H, D]
+        # Fall back to SDPA when Q and K/V have different sequence lengths
+        # (e.g. cross-attention).  sage3's qk_smoothing and kernel both
+        # assume N_q == N_k and produce out-of-bounds accesses otherwise.
+        if query.shape[1] != key.shape[1]:
+            return self._forward_sdpa(query, key, value)
         return self._forward_sage3(query, key, value)
+
+    def _forward_sdpa(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        """SDPA fallback for cross-attention (N_q != N_k)."""
+        # Input is NHD [B, N, H, D]; SDPA expects [B, H, N, D]
+        q = query.transpose(1, 2)
+        k = key.transpose(1, 2)
+        v = value.transpose(1, 2)
+        out = F.scaled_dot_product_attention(
+            q, k, v, scale=self.softmax_scale, is_causal=False
+        )
+        return out.transpose(1, 2)  # back to NHD
 
     @torch.compiler.disable()
     def _forward_sage3(
@@ -75,6 +97,28 @@ class Sage3TritonImpl(AttentionImpl):
         q = query.transpose(1, 2).contiguous()
         k = key.transpose(1, 2).contiguous()
         v = value.transpose(1, 2).contiguous()
+
+        # Dump self-attention inputs for offline analysis
+        if os.environ.get("SAGE3_DUMP_INPUTS", "0") == "1":
+            dump_dir = os.environ.get("SAGE3_DUMP_DIR", "/tmp/sage3_inputs")
+            os.makedirs(dump_dir, exist_ok=True)
+            if not hasattr(self, "_dump_count"):
+                self._dump_count = 0
+            max_dumps = int(os.environ.get("SAGE3_DUMP_MAX", "1"))
+            if self._dump_count < max_dumps:
+                path = os.path.join(dump_dir, f"self_attn_input_{self._dump_count}.pt")
+                torch.save({
+                    "q": q.cpu(),
+                    "k": k.cpu(),
+                    "v": v.cpu(),
+                    "sm_scale": self.softmax_scale,
+                    "is_causal": self.causal,
+                    "config": self._config,
+                    "acc_dtype": self._acc_dtype,
+                    "q_shape": list(q.shape),  # [B, H, N, D]
+                }, path)
+                logger.info("Dumped self-attention inputs to %s", path)
+                self._dump_count += 1
 
         out = _sage3_fn(
             q,
