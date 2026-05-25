@@ -189,10 +189,11 @@ def _mixed_attn_fwd_inner(
         p_reshaped = tl.reshape(p, [BLOCK_M, BLOCK_N // 32, 32])
         p_amax = tl.max(p_reshaped, 2)  # [BLOCK_M, BLOCK_N // 32]
 
-        # E8M0 scale: encoding = ceil(log2(amax)) + 127
-        p_amax_safe = tl.maximum(p_amax, 1e-12)
+        # E8M0 scale: encoding = ceil(log2(amax / 448)) + 127, clamped to [0, 254]
+        FP8_E4M3_MAX: tl.constexpr = 448.0
+        p_amax_safe = tl.maximum(p_amax / FP8_E4M3_MAX, 1e-12)
         p_log2 = tl.math.ceil(tl.math.log2(p_amax_safe))
-        p_e8m0 = tl.maximum(p_log2 + 127, 0.0).to(tl.uint8)  # [BLOCK_M, BLOCK_N // 32]
+        p_e8m0 = tl.minimum(tl.maximum(p_log2 + 127, 0.0), 254.0).to(tl.uint8)  # [BLOCK_M, BLOCK_N // 32]
 
         # Compute float scale for quantizing P
         p_scale_f32 = tl.math.exp2((p_e8m0.to(tl.float32) - 127.0))
