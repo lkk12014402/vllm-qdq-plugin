@@ -1,13 +1,16 @@
 """Benchmark: SAGE3 HW kernels vs BF16 SDPA on [1, 40, 75600, 128]."""
 
+import os
 import sys
 import json
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, "/home/yiliu7/workspace/vllm-qdq-plugin/src")
+# Resolve paths relative to this script to avoid hardcoded user-specific paths
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 # Bypass top-level vllm dependency by importing the sage3 subpackage directly
-sys.path.insert(0, "/home/yiliu7/workspace/vllm-qdq-plugin/src/vllm_qdq_plugin/sage3_attn")
+sys.path.insert(0, os.path.join(REPO_ROOT, "src", "vllm_qdq_plugin", "sage3_attn"))
 from sage3.api import sageattn3_standalone
 
 # ── Config ──
@@ -86,7 +89,7 @@ def main():
             print(f"{name:<30} {'FAIL':>12} {'N/A':>8}")
 
     # Save raw results
-    out_path = "/home/yiliu7/workspace/vllm-qdq-plugin/bench_hw_vs_sdpa_results.json"
+    out_path = os.path.join(REPO_ROOT, "bench_hw_vs_sdpa_results.json")
     meta = {"shape": [B, H, N, D], "dtype": str(DTYPE), "warmup": WARMUP, "iters": ITERS,
             "device": torch.cuda.get_device_name(), "total_flops": total_flops}
     with open(out_path, "w") as f:
