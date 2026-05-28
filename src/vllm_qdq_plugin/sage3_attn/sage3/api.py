@@ -205,6 +205,53 @@ def _run_attention(
             output = output[:, :, :original_seq_len, :].contiguous()
         return output.to(q.dtype)
 
+    # ── Hardware NVFP4 early dispatch (E2M1 data + E4M3 scales, group_size=16) ──
+    if config.name == "nvfp4_hw":
+        from .nvfp4_hw_kernel import nvfp4_flash_attention, quantize_to_nvfp4
+        print_once(f"[SAGE3 TRACE] nvfp4_hw kernel dispatched: Q={q.shape}, K={k.shape}, V={v.shape}, D={D}")
+
+        # Apply QK smoothing for delta_s correction
+        disable_per_block_mean = _get_env_bool('SAGE3_DISABLE_PER_BLOCK_MEAN')
+        delta_s = None
+        if per_block_mean and not disable_per_block_mean:
+            ctx = TransformContext()
+            q, k, v, ctx = qk_smoothing(q, k, v, ctx)
+            delta_s = ctx.delta_s
+
+        # Pad sequence to BLOCK_M=128
+        if N % 128 != 0:
+            pad_len = 128 - (N % 128)
+            q = F.pad(q, (0, 0, 0, pad_len))
+            k = F.pad(k, (0, 0, 0, pad_len))
+            v = F.pad(v, (0, 0, 0, pad_len))
+            B, H, N, D = q.shape
+            if delta_s is not None:
+                delta_s = F.pad(delta_s, (0, pad_len))
+
+        if sm_scale is None:
+            sm_scale = 1.0 / math.sqrt(D)
+
+        # Quantize Q, K to NVFP4 (group_size=16) -> [B,H,N,D//2] uint8 + [B,H,N,D//16] fp8
+        q_packed, q_scale = quantize_to_nvfp4(q)
+        k_packed, k_scale = quantize_to_nvfp4(k)
+        # V: permute to [B,H,D,N], quantize along N (group_size=16)
+        v_t = v.permute(0, 1, 3, 2).contiguous()  # [B,H,D,N]
+        v_flat = v_t.reshape(-1, N)
+        v_packed_flat, v_scale_flat = quantize_to_nvfp4(v_flat)
+        v_packed = v_packed_flat.reshape(B, H, D, N // 2)
+        v_scale = v_scale_flat.reshape(B, H, D, N // 16)
+
+        output = nvfp4_flash_attention(
+            q_packed, k_packed, v_packed,
+            q_scale, k_scale, v_scale,
+            causal=is_causal, sm_scale=sm_scale,
+            delta_s=delta_s,
+        )
+
+        if output.size(2) != original_seq_len:
+            output = output[:, :, :original_seq_len, :].contiguous()
+        return output.to(q.dtype)
+
     # ── Mixed MXFP8 QK + MXFP4 PV early dispatch ──
     if config.name == "mixed_mxfp8qk_mxfp4pv_hw":
         from .mixed_mxfp8qk_mxfp4pv_hw_kernel import (
