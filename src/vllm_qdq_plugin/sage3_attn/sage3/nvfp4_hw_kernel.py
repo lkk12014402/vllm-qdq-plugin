@@ -34,13 +34,13 @@ def _float_to_e2m1_nibble(x: torch.Tensor) -> torch.Tensor:
     ax = x.abs().clamp(max=6.0)
 
     code = torch.zeros_like(ax, dtype=torch.uint8)
-    code = torch.where(ax >= 0.25, torch.ones_like(code), code)
-    code = torch.where(ax >= 0.75, torch.full_like(code, 2), code)
-    code = torch.where(ax >= 1.25, torch.full_like(code, 3), code)
-    code = torch.where(ax >= 1.75, torch.full_like(code, 4), code)
-    code = torch.where(ax >= 2.5, torch.full_like(code, 5), code)
-    code = torch.where(ax >= 3.5, torch.full_like(code, 6), code)
-    code = torch.where(ax >= 5.0, torch.full_like(code, 7), code)
+    code = torch.where(ax >= 0.25, 1, code)
+    code = torch.where(ax >= 0.75, 2, code)
+    code = torch.where(ax >= 1.25, 3, code)
+    code = torch.where(ax >= 1.75, 4, code)
+    code = torch.where(ax >= 2.5, 5, code)
+    code = torch.where(ax >= 3.5, 6, code)
+    code = torch.where(ax >= 5.0, 7, code)
 
     return sign | code
 
@@ -173,16 +173,14 @@ def compute_p_scale_e4m3(
     # Scale = amax / 6.0 (so that max value maps to 6.0 in E2M1)
     # Clamp to avoid division by zero
     p_scale = p_amax / FP4_E2M1_MAX
-    p_scale = tl.maximum(p_scale, 1e-12)
+    p_scale = tl.maximum(p_scale, 0.001953125)  # E4M3 min subnormal = 2^-9
 
     # Cast to E4M3 (the hardware will use this scale directly)
     p_scale_e4m3 = p_scale.to(tl.float8e4nv)
 
-    # Compute inverse for scaling P values before packing
-    # Use the float32 value (not the rounded E4M3) for better numerical precision
-    # Actually, to match hardware exactly, use the rounded value
+    # Compute inverse from unrounded amax for better numerical precision in quantization
     p_scale_f32 = p_scale_e4m3.to(tl.float32)
-    inv_scale = FP4_E2M1_MAX / tl.maximum(p_amax, 1e-12)
+    inv_scale = FP4_E2M1_MAX / tl.maximum(p_amax, 0.001953125 * FP4_E2M1_MAX)
 
     NUM_GROUPS: tl.constexpr = BLOCK_N // GROUP_SIZE
     inv_scale_expanded = tl.reshape(
