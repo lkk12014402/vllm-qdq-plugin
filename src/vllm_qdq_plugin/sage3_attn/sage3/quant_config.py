@@ -328,6 +328,15 @@ def _register_builtin_configs():
         pre_transforms=(),
     )
 
+    # Hardware MXFP4 with Hadamard Rotation — improves accuracy by redistributing magnitudes
+    ATTENTION_CONFIGS["mxfp4_hw_rotation"] = AttentionConfig(
+        name="mxfp4_hw_rotation",
+        qk_quant=None,
+        pv_quant=None,
+        p_quant_fn=None,
+        pre_transforms=(),  # Rotation applied in api.py dispatch for hw configs
+    )
+
     # Mixed MXFP8 QK + MXFP4 PV — uses tl.dot_scaled with e4m3 for QK and e2m1 for PV
     ATTENTION_CONFIGS["mixed_mxfp8qk_mxfp4pv_hw"] = AttentionConfig(
         name="mixed_mxfp8qk_mxfp4pv_hw",
@@ -348,7 +357,7 @@ def _register_builtin_configs():
 
     # Validate all configs at registration time (skip hardware MX configs)
     for config in ATTENTION_CONFIGS.values():
-        if config.name in ("mxfp8_hw", "mxfp4_hw", "mixed_mxfp8qk_mxfp4pv_hw", "mixed_mxfp4qk_mxfp8pv_hw"):
+        if config.name in ("mxfp8_hw", "mxfp4_hw", "mxfp4_hw_rotation", "mixed_mxfp8qk_mxfp4pv_hw", "mixed_mxfp4qk_mxfp8pv_hw"):
             continue
         config.validate()
 
