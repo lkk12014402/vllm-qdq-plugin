@@ -92,6 +92,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SAGE3_ROUTE_FILE": lambda: os.getenv("SAGE3_ROUTE_FILE", ""),
     # When truthy, log which quant config the router resolves per (layer, step).
     "SAGE3_ROUTE_DEBUG": lambda: _env_flag("SAGE3_ROUTE_DEBUG"),
+    # SpargeAttn block-sparse attention backend (mutually exclusive with sage3).
+    "VLLM_SPARGE_ATTN": lambda: _env_flag("VLLM_SPARGE_ATTN"),
+    # Path to the SpargeAttn repo; injected on sys.path at registration when the
+    # spas_sage_attn package is not already importable. Empty string = rely on the
+    # package already being installed/importable.
+    "SPARGE_ATTN_REPO": lambda: os.getenv("SPARGE_ATTN_REPO", ""),
+    # "topk" (block-sparsity by fraction kept) or "cdfthreshd" (adaptive CDF threshold).
+    "SPARGE_MODE": env_with_choices(
+        "SPARGE_MODE",
+        default="topk",
+        choices=["topk", "cdfthreshd"],
+        case_sensitive=False,
+    ),
+    # Fraction of KV blocks to keep when SPARGE_MODE=topk. 1.0 = dense (keep all),
+    # which isolates quantization error for correctness checks.
+    "SPARGE_TOPK": lambda: os.getenv("SPARGE_TOPK", "1.0"),
+    # CDF threshold when SPARGE_MODE=cdfthreshd (keep blocks up to this prob mass).
+    "SPARGE_CDFTHRESHD": lambda: os.getenv("SPARGE_CDFTHRESHD", "0.98"),
 }
 
 
