@@ -87,6 +87,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SAGE3_CUTE": lambda: _env_flag("VLLM_SAGE3_CUTE"),
     "SAGE3_QUANT_FORMAT": lambda: os.getenv("SAGE3_QUANT_FORMAT", "mxfp4"),
     "SAGE3_ACC_DTYPE": lambda: os.getenv("SAGE3_ACC_DTYPE", "fp32"),
+    # Per-(layer, denoising-step) attention quant-config routing.
+    # Path to a JSON route file; empty string disables routing.
+    "SAGE3_ROUTE_FILE": lambda: os.getenv("SAGE3_ROUTE_FILE", ""),
+    # When truthy, log which quant config the router resolves per (layer, step).
+    "SAGE3_ROUTE_DEBUG": lambda: _env_flag("SAGE3_ROUTE_DEBUG"),
 }
 
 

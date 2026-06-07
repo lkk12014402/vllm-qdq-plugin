@@ -60,6 +60,8 @@ class Sage3TritonImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: AttentionMetadata = None,
+        *,
+        config_override: str | None = None,
     ) -> torch.Tensor:
         # Input layout: NHD = [B, N, H, D]
         # Fall back to SDPA when Q and K/V have different sequence lengths
@@ -67,7 +69,8 @@ class Sage3TritonImpl(AttentionImpl):
         # assume N_q == N_k and produce out-of-bounds accesses otherwise.
         if query.shape[1] != key.shape[1]:
             return self._forward_sdpa(query, key, value)
-        return self._forward_sage3(query, key, value)
+        cfg = config_override or self._config
+        return self._forward_sage3(query, key, value, config=cfg)
 
     def _forward_sdpa(
         self,
@@ -91,8 +94,10 @@ class Sage3TritonImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
+        config: str | None = None,
     ) -> torch.Tensor:
         """Forward using sage3 Triton kernel."""
+        cfg = config or self._config
         # sage3 expects HND = [B, H, N, D], input is NHD = [B, N, H, D]
         q = query.transpose(1, 2).contiguous()
         k = key.transpose(1, 2).contiguous()
@@ -113,7 +118,7 @@ class Sage3TritonImpl(AttentionImpl):
                     "v": v.cpu(),
                     "sm_scale": self.softmax_scale,
                     "is_causal": self.causal,
-                    "config": self._config,
+                    "config": cfg,
                     "acc_dtype": self._acc_dtype,
                     "q_shape": list(q.shape),  # [B, H, N, D]
                 }, path)
@@ -124,7 +129,7 @@ class Sage3TritonImpl(AttentionImpl):
             q,
             k,
             v,
-            config=self._config,
+            config=cfg,
             is_causal=self.causal,
             sm_scale=self.softmax_scale,
             acc_dtype=self._acc_dtype,

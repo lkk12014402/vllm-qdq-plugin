@@ -70,6 +70,27 @@ def register_omni_sage3_cute():
         )
 
 
+def _maybe_install_route(route_file: str):
+    """Install per-(layer, step) attention routing if a route file is set.
+
+    A bad route file logs and falls back to un-routed behavior rather than
+    killing worker startup.
+    """
+    if not route_file:
+        return
+    try:
+        from .sage3_attn.routing import patch_attention
+
+        patch_attention.install(route_file)
+    except Exception as e:
+        logger.warning(
+            "vllm-qdq-plugin: failed to install sage3 attention routing "
+            "from %s (%s) — continuing without routing",
+            route_file,
+            e,
+        )
+
+
 def register_omni():
     """Called by vllm-omni plugin loader in diffusion workers.
 
@@ -81,6 +102,7 @@ def register_omni():
         logger.warning_once(
             "vllm-qdq-plugin: registered sage3 Triton backend for vllm-omni"
         )
+        _maybe_install_route(envs.SAGE3_ROUTE_FILE)
     elif envs.VLLM_SAGE3_CUTE:
         register_omni_sage3_cute()
         logger.warning_once(
