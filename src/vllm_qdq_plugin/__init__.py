@@ -70,6 +70,43 @@ def register_omni_sage3_cute():
         )
 
 
+def register_omni_sparge_attn():
+    import importlib.util
+    import sys
+
+    # Put the SpargeAttn repo on sys.path if its package is not already importable.
+    # register_omni runs at worker startup, before any Attention module is built and
+    # thus before backend.get_impl_cls() triggers the spas_sage_attn import — so the
+    # path is in place by the time the impl is loaded.
+    if importlib.util.find_spec("spas_sage_attn") is None and envs.SPARGE_ATTN_REPO:
+        sys.path.insert(0, envs.SPARGE_ATTN_REPO)
+        logger.warning(
+            "vllm-qdq-plugin: added SPARGE_ATTN_REPO to sys.path (%s)",
+            envs.SPARGE_ATTN_REPO,
+        )
+
+    try:
+        from vllm_omni.diffusion.attention.backends.registry import (
+            DiffusionAttentionBackendEnum,
+            register_diffusion_backend,
+        )
+
+        register_diffusion_backend(
+            DiffusionAttentionBackendEnum.SAGE_ATTN,
+            "vllm_qdq_plugin.sparge_attn.backend.SpargeAttnBackend",
+        )
+        logger.warning(
+            "vllm-qdq-plugin: registered SpargeAttn backend as SAGE_ATTN "
+            "(VLLM_SPARGE_ATTN=1)"
+        )
+    except ImportError as e:
+        logger.warning(
+            "vllm-qdq-plugin: cannot register SpargeAttn backend — "
+            "vllm_omni not available (%s)",
+            e,
+        )
+
+
 def _maybe_install_route(route_file: str):
     """Install per-(layer, step) attention routing if a route file is set.
 
@@ -97,7 +134,21 @@ def register_omni():
     Conditionally overrides SAGE_ATTN backend with sage3 Triton implementation.
     When VLLM_SAGE3_TRITON=0 (default), does nothing — original in-tree backend used.
     """
-    if envs.VLLM_SAGE3_TRITON:
+    # sage3 and SpargeAttn both override the SAGE_ATTN slot, so they are mutually
+    # exclusive. If both are requested, SpargeAttn wins deterministically.
+    sage3_requested = envs.VLLM_SAGE3_TRITON or envs.VLLM_SAGE3_CUTE
+    if envs.VLLM_SPARGE_ATTN and sage3_requested:
+        logger.warning(
+            "vllm-qdq-plugin: both VLLM_SPARGE_ATTN and a sage3 flag are set; "
+            "they share the SAGE_ATTN backend slot. Using SpargeAttn."
+        )
+
+    if envs.VLLM_SPARGE_ATTN:
+        register_omni_sparge_attn()
+        logger.warning_once(
+            "vllm-qdq-plugin: registered SpargeAttn backend for vllm-omni"
+        )
+    elif envs.VLLM_SAGE3_TRITON:
         register_omni_sage3_triton()
         logger.warning_once(
             "vllm-qdq-plugin: registered sage3 Triton backend for vllm-omni"
