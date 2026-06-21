@@ -76,6 +76,22 @@ def env_with_choices(
 environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_QDQ_TRACE": lambda: _env_flag("VLLM_QDQ_TRACE"),
     "VLLM_QDQ": lambda: _env_flag("VLLM_QDQ"),
+    # QuaRot/SpinQuant rotation + MXFP4 inference: registers the
+    # 'spinquant_mxfp4' quantization config when truthy.
+    "VLLM_SPINQUANT_MXFP4": lambda: _env_flag("VLLM_SPINQUANT_MXFP4"),
+    # Runtime weight backend for spinquant_mxfp4. Empty string defers to
+    # spinquant_config.runtime_backend in the checkpoint (default preunpack_bf16).
+    "VLLM_SPINQUANT_RUNTIME_BACKEND": env_with_choices(
+        "VLLM_SPINQUANT_RUNTIME_BACKEND",
+        default=None,
+        choices=["packed_fused", "preunpack_bf16", "preunpack_fp8"],
+        case_sensitive=False,
+    ),
+    # MXFP4 activation QDQ backend override (forward-compatible; only the
+    # pure-PyTorch "even" mode is vendored here).
+    "VLLM_SPINQUANT_MXFP4_QDQ_BACKEND": lambda: os.getenv(
+        "VLLM_SPINQUANT_MXFP4_QDQ_BACKEND", ""
+    ),
     "VLLM_MARLIN_MOE_QDQ_MODE": env_with_choices(
         "VLLM_MARLIN_MOE_QDQ_MODE",
         default="0",
@@ -129,3 +145,26 @@ def is_set(name: str):
     if name in environment_variables:
         return name in os.environ
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def register_with_vllm_envs() -> None:
+    """Register this plugin's ``VLLM_*`` env vars with vLLM's env registry.
+
+    vLLM's ``validate_environ`` warns ("Unknown vLLM environment variable
+    detected: ...") for any ``VLLM_``-prefixed variable it does not know about.
+    Plugins load before that validation runs, so registering our getters here
+    makes vLLM recognize the variables and suppresses the spurious warning.
+    Idempotent and never clobbers existing vLLM entries.
+    """
+    try:
+        import vllm.envs as vllm_envs
+    except Exception:
+        return
+    for name, getter in environment_variables.items():
+        if name.startswith("VLLM_"):
+            vllm_envs.environment_variables.setdefault(name, getter)
+
+
+# Run at import time: the plugin package is imported during vLLM's
+# load_general_plugins(), which happens before validate_environ().
+register_with_vllm_envs()

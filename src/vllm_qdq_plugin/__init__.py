@@ -12,8 +12,49 @@ from . import envs
 logger = init_logger(__name__)
 
 
+def _setup_plugin_logging() -> None:
+    """Route this plugin's loggers through vLLM's handler at vLLM's log level.
+
+    vLLM's logging config only attaches a handler to the ``vllm`` logger
+    namespace (with ``propagate=False`` and INFO level). Our ``vllm_qdq_plugin``
+    loggers live in a different namespace, so without this they inherit the root
+    logger's WARNING level and emit nothing below WARNING (and only via Python's
+    bare lastResort handler). Attaching vLLM's handler makes plugin INFO logs
+    visible with consistent formatting. Idempotent.
+    """
+    import logging
+
+    pkg_logger = logging.getLogger("vllm_qdq_plugin")
+    if getattr(pkg_logger, "_vllm_qdq_log_configured", False):
+        return
+
+    try:
+        import vllm.envs as vllm_envs
+
+        level = vllm_envs.VLLM_LOGGING_LEVEL
+    except Exception:
+        level = "INFO"
+
+    vllm_logger = logging.getLogger("vllm")
+    if vllm_logger.handlers:
+        for handler in vllm_logger.handlers:
+            if handler not in pkg_logger.handlers:
+                pkg_logger.addHandler(handler)
+        pkg_logger.propagate = False
+
+    pkg_logger.setLevel(level)
+    pkg_logger._vllm_qdq_log_configured = True
+
+
 def register():
     """Called by vLLM plugin loader in every process (main + workers)."""
+
+    _setup_plugin_logging()
+
+    if envs.VLLM_SPINQUANT_MXFP4:
+        from .rotation import register_spinquant_mxfp4
+
+        register_spinquant_mxfp4()
 
     if not envs.VLLM_QDQ:
         return
@@ -134,6 +175,7 @@ def register_omni():
     Conditionally overrides SAGE_ATTN backend with sage3 Triton implementation.
     When VLLM_SAGE3_TRITON=0 (default), does nothing — original in-tree backend used.
     """
+    _setup_plugin_logging()
     # sage3 and SpargeAttn both override the SAGE_ATTN slot, so they are mutually
     # exclusive. If both are requested, SpargeAttn wins deterministically.
     sage3_requested = envs.VLLM_SAGE3_TRITON or envs.VLLM_SAGE3_CUTE

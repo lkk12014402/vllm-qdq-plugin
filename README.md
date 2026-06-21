@@ -71,6 +71,83 @@ Apache-2.0
 
 ---
 
+## QuaRot / SpinQuant Rotation + MXFP4 Inference
+
+This plugin also ships a **standalone** (zero `auto_round` dependency) vLLM
+quantization config that runs MXFP4-quantized models exported by auto-round with
+**QuaRot/SpinQuant rotations applied online at inference time**.
+
+### How It Works
+
+Unlike the QDQ simulation path above, rotation support registers a real vLLM
+`QuantizationConfig` named `spinquant_mxfp4` (via `@register_quantization_config`)
+plus backend-specific `LinearMethodBase` implementations. For each linear layer it:
+
+1. Reconstructs R1/R4 rotation state from checkpoint buffers
+   (`spinquant_{r1,r4}_type|size|matrix`) at load time.
+2. Prepares the weight for the chosen runtime backend.
+3. Per forward: applies the online R1 (q/k/v/gate/up input) or R4 (down_proj
+   input) rotation, runs MXFP4 activation QDQ, then the GEMM.
+
+Rotation handling:
+
+- **R1 / R4** — applied online (Hadamard butterfly when full-size, else block
+  Hadamard / trained / random matrix).
+- **R2** — fully fused offline into v_proj/o_proj weights at quantization time;
+  the plugin only ignores the leftover top-level `spinquant_R*` checkpoint keys.
+- **R3** (post-RoPE) — not supported; models needing R3 are out of scope here.
+
+Selective rotation: when an unrotated layer (e.g. v_proj) is merged into a
+rotated layer (qkv_proj), its weight is compensated at load time
+(`W @ H`) so the uniform online `x @ H` cancels exactly — zero runtime overhead
+(non-packed backends only).
+
+### Usage
+
+```bash
+# Enable the spinquant_mxfp4 quantization config
+VLLM_SPINQUANT_MXFP4=1 python my_script.py
+
+# With vllm serve (backend defaults to preunpack_bf16)
+VLLM_SPINQUANT_MXFP4=1 vllm serve /path/to/rotated-mxfp4-model
+
+# Force a runtime weight backend
+VLLM_SPINQUANT_MXFP4=1 VLLM_SPINQUANT_RUNTIME_BACKEND=preunpack_bf16 vllm serve ...
+```
+
+### Runtime Backends
+
+| Backend | Description | Selective compensation |
+|---|---|---|
+| `preunpack_bf16` (default) | Load-time dequant to BF16, `F.linear` | ✅ |
+| `preunpack_fp8` | Load-time FP8 unpack + per-forward restore | ✅ |
+| `packed_fused` | Keep MXFP4 packed, Triton fused GEMM | ❌ |
+
+### Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `VLLM_SPINQUANT_MXFP4` | `0` | Set to `1` to register the `spinquant_mxfp4` config |
+| `VLLM_SPINQUANT_RUNTIME_BACKEND` | (checkpoint) | Override weight backend (`packed_fused`, `preunpack_bf16`, `preunpack_fp8`) |
+| `VLLM_SPINQUANT_MXFP4_QDQ_BACKEND` | `""` | Activation QDQ backend override (only pure-PyTorch "even" mode is bundled) |
+
+Legacy `AUTO_ROUND_SPINQUANT_RUNTIME_BACKEND` / `AUTO_ROUND_MXFP4_QDQ_BACKEND`
+are still honored for compatibility.
+
+> The plugin registers its `VLLM_*` variables with vLLM's env registry at load
+> time, so vLLM no longer prints `Unknown vLLM environment variable detected`
+> for them. Plugin loggers are also routed through vLLM's handler so the
+> rotation/registration `INFO` logs are visible.
+
+### Notes
+
+- The MXFP4 activation QDQ custom op is registered on the platform dispatch key
+  (CUDA), so inference runs on GPU.
+- The Triton fused MXFP4 GEMM (`packed_fused`) is bundled but optional; without
+  Triton the `preunpack_*` backends use plain dequant + `F.linear`.
+
+---
+
 ## Sage3 Triton Attention Backend (vllm-omni)
 
 This plugin also provides an **out-of-tree diffusion attention backend** for [vllm-omni](https://github.com/vllm-project/vllm-omni), using the [SageAttention3](https://github.com/thu-ml/SageAttention) standalone Triton kernel.
