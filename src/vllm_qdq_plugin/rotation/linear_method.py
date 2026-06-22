@@ -30,6 +30,11 @@ from .constants import (
     RUNTIME_BACKEND_PREUNPACK_BF16,
     RUNTIME_BACKEND_PREUNPACK_FP8,
 )
+from ._mxfp4_common import (
+    clear_packed_storage,
+    dense_linear_stable_dtype,
+    register_mxfp4_packed_weight,
+)
 from .hadamard import (
     build_block_hadamard,
     generate_random_orthogonal,
@@ -76,24 +81,14 @@ class SpinQuantMXFP4LinearMethod(LinearMethodBase):
         # QKVParallelLinear -> [q, k, v]; MergedColumnParallelLinear -> [gate, up].
         layer._output_partition_sizes = output_partition_sizes
 
-        # Packed MXFP4 weight: [N, K//2] uint8.
-        weight_packed = Parameter(
-            torch.empty(output_size_per_partition, input_size_per_partition // 2, dtype=torch.uint8),
-            requires_grad=False,
+        # Packed MXFP4 weight + e8m0 scale (shared layout with the Hadamard method).
+        register_mxfp4_packed_weight(
+            layer,
+            output_size_per_partition=output_size_per_partition,
+            input_size_per_partition=input_size_per_partition,
+            group_size=group_size,
+            extra_weight_attrs=extra_weight_attrs,
         )
-        set_weight_attrs(
-            weight_packed,
-            {"input_dim": 1, "output_dim": 0, "packed_dim": 1, "pack_factor": 2} | extra_weight_attrs,
-        )
-        layer.register_parameter("weight_packed", weight_packed)
-
-        # Scale: [N, K//group_size] uint8 (e8m0).
-        weight_scale = Parameter(
-            torch.empty(output_size_per_partition, input_size_per_partition // group_size, dtype=torch.uint8),
-            requires_grad=False,
-        )
-        set_weight_attrs(weight_scale, {"input_dim": 1, "output_dim": 0} | extra_weight_attrs)
-        layer.register_parameter("weight_scale", weight_scale)
 
         # R1 rotation metadata (scalar int32 buffers loaded from checkpoint).
         spinquant_r1_type = Parameter(torch.zeros((), dtype=torch.int32), requires_grad=False)
@@ -254,7 +249,10 @@ class SpinQuantMXFP4LinearMethod(LinearMethodBase):
                 R = generate_random_orthogonal(rot_size, device)
 
         if R is not None:
-            setattr(layer, result_attr, R.to(torch.float16))
+            # Store in the activation dtype so the per-forward ``.to(x.dtype)`` in
+            # _apply_rotation is a no-op (no copy) in the common case, while still
+            # being correct if activations arrive in a different dtype.
+            setattr(layer, result_attr, R.to(getattr(layer, "params_dtype", torch.bfloat16)))
             setattr(layer, rot_size_attr, rot_size)
             setattr(layer, runtime_attr, ROTATION_RUNTIME_MATRIX)
 
@@ -276,7 +274,7 @@ class SpinQuantMXFP4LinearMethod(LinearMethodBase):
                 target_dtype=target_dtype,
             )
             layer.weight_dense_qdq = Parameter(weight_dense, requires_grad=False)
-            _clear_packed_weight_storage(layer)
+            clear_packed_storage(layer)
             return
 
         if backend == RUNTIME_BACKEND_PREUNPACK_FP8:
@@ -287,7 +285,7 @@ class SpinQuantMXFP4LinearMethod(LinearMethodBase):
             )
             layer.weight_unpacked_fp8 = Parameter(weight_fp8, requires_grad=False)
             layer.weight_scale_bf16 = Parameter(scale_bf16, requires_grad=False)
-            _clear_packed_weight_storage(layer)
+            clear_packed_storage(layer)
             return
 
         raise ValueError(f"Unsupported SpinQuant runtime backend: {backend}")
@@ -434,24 +432,6 @@ class SpinQuantMXFP4LinearMethod(LinearMethodBase):
         x = x.reshape(*shape[:-1], -1, rot_size)
         return (x @ R).reshape(shape)
 
-    @staticmethod
-    def _apply_dense_linear(
-        weight: torch.Tensor,
-        x: torch.Tensor,
-        bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Run dense GEMM while keeping activation/output dtype stable."""
-        input_dtype = x.dtype
-        compute_dtype = weight.dtype
-        if x.dtype != compute_dtype:
-            x = x.to(compute_dtype)
-        if bias is not None and bias.dtype != compute_dtype:
-            bias = bias.to(compute_dtype)
-        output = torch.nn.functional.linear(x, weight, bias)
-        if output.dtype != input_dtype:
-            output = output.to(input_dtype)
-        return output
-
 
 class SpinQuantMXFP4PackedFusedLinearMethod(SpinQuantMXFP4LinearMethod):
     """Packed low-bit runtime: activation qdq + fused weight dequant/GEMM."""
@@ -471,7 +451,7 @@ class SpinQuantMXFP4PreunpackBF16LinearMethod(SpinQuantMXFP4LinearMethod):
 
     def apply(self, layer, x, bias=None):
         x = self._prepare_activations(layer, x)
-        return self._apply_dense_linear(layer.weight_dense_qdq, x, bias)
+        return dense_linear_stable_dtype(layer.weight_dense_qdq, x, bias)
 
 
 class SpinQuantMXFP4PreunpackFP8LinearMethod(SpinQuantMXFP4LinearMethod):
@@ -484,22 +464,4 @@ class SpinQuantMXFP4PreunpackFP8LinearMethod(SpinQuantMXFP4LinearMethod):
             layer.weight_scale_bf16,
             target_dtype=getattr(layer, "params_dtype", x.dtype),
         )
-        return self._apply_dense_linear(weight_dense, x, bias)
-
-
-def _clear_packed_weight_storage(layer: torch.nn.Module) -> None:
-    """Replace packed-weight storage with scalar dummies after an alternate backend prep.
-
-    Uses 1-element dummies instead of deleting so torch.compile cached graphs never
-    hit a missing key; shape guards trigger healthy re-compilation instead.
-    """
-    device = "cpu"
-    if hasattr(layer, "weight_packed") and layer.weight_packed is not None:
-        device = layer.weight_packed.device
-        layer.weight_packed = Parameter(
-            torch.empty(1, dtype=torch.uint8, device=device), requires_grad=False
-        )
-    if hasattr(layer, "weight_scale") and layer.weight_scale is not None:
-        layer.weight_scale = Parameter(
-            torch.empty(1, dtype=torch.uint8, device=device), requires_grad=False
-        )
+        return dense_linear_stable_dtype(weight_dense, x, bias)

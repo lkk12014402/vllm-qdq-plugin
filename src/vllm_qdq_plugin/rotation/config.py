@@ -17,8 +17,8 @@ import torch
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization import register_quantization_config
-from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
+from ._config_base import MXFP4RotationConfigBase, data_type_is_mxfp
 from .constants import (
     RUNTIME_BACKEND_PACKED_FUSED,
     RUNTIME_BACKEND_PREUNPACK_BF16,
@@ -54,7 +54,7 @@ def _resolve_runtime_backend(config: dict[str, Any]) -> str:
 
 
 @register_quantization_config("spinquant_mxfp4")
-class SpinQuantMXFP4Config(QuantizationConfig):
+class SpinQuantMXFP4Config(MXFP4RotationConfigBase):
     """Quantization config for SpinQuant/QuaRot online rotation + MXFP4."""
 
     def __init__(
@@ -109,18 +109,6 @@ class SpinQuantMXFP4Config(QuantizationConfig):
     @classmethod
     def get_name(cls) -> str:
         return "spinquant_mxfp4"
-
-    @classmethod
-    def get_supported_act_dtypes(cls) -> list[torch.dtype]:
-        return [torch.bfloat16, torch.float16, torch.float32]
-
-    @classmethod
-    def get_min_capability(cls) -> int:
-        return 70  # Volta+
-
-    @staticmethod
-    def get_config_filenames() -> list[str]:
-        return ["config.json"]
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "SpinQuantMXFP4Config":
@@ -200,8 +188,7 @@ class SpinQuantMXFP4Config(QuantizationConfig):
         sq = hf_quant_cfg.get("spinquant_config", {})
         if not sq or not sq.get("online_r1_rotation", False):
             return None
-        data_type = hf_quant_cfg.get("data_type", "").lower()
-        if "mxfp" in data_type or "mx_fp" in data_type:
+        if data_type_is_mxfp(hf_quant_cfg):
             return "spinquant_mxfp4"
         return None
 

@@ -44,6 +44,11 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearMethodBase
 from vllm.model_executor.utils import set_weight_attrs
 
+from ._mxfp4_common import (
+    clear_packed_storage,
+    dense_linear_stable_dtype,
+    register_mxfp4_packed_weight,
+)
 from .hadamard import deterministic_hadamard_matrix
 from .mxfp4 import dequant_packed_mxfp4_weight
 from .perlinear_config import HADAMARD_TYPE_RANDOM
@@ -83,24 +88,14 @@ class HadamardMXFP4LinearMethod(LinearMethodBase):
         layer._output_partition_sizes = list(output_partition_sizes)
         num_partitions = len(output_partition_sizes)
 
-        # Packed MXFP4 weight: [N, K//2] uint8.
-        weight_packed = Parameter(
-            torch.empty(output_size_per_partition, input_size_per_partition // 2, dtype=torch.uint8),
-            requires_grad=False,
+        # Packed MXFP4 weight + e8m0 scale (shared layout with the SpinQuant method).
+        register_mxfp4_packed_weight(
+            layer,
+            output_size_per_partition=output_size_per_partition,
+            input_size_per_partition=input_size_per_partition,
+            group_size=group_size,
+            extra_weight_attrs=extra_weight_attrs,
         )
-        set_weight_attrs(
-            weight_packed,
-            {"input_dim": 1, "output_dim": 0, "packed_dim": 1, "pack_factor": 2} | extra_weight_attrs,
-        )
-        layer.register_parameter("weight_packed", weight_packed)
-
-        # Scale: [N, K//group_size] uint8 (e8m0).
-        weight_scale = Parameter(
-            torch.empty(output_size_per_partition, input_size_per_partition // group_size, dtype=torch.uint8),
-            requires_grad=False,
-        )
-        set_weight_attrs(weight_scale, {"input_dim": 1, "output_dim": 0} | extra_weight_attrs)
-        layer.register_parameter("weight_scale", weight_scale)
 
         # Per-partition block Hadamard buffer: [num_partitions, bs, bs].
         # auto-round serializes one ``hadamard_matrix`` per ORIGINAL Linear
@@ -129,37 +124,26 @@ class HadamardMXFP4LinearMethod(LinearMethodBase):
         bs = self.quant_config.block_size
         partition_sizes = layer._output_partition_sizes
         num_partitions = len(partition_sizes)
+        target_dtype = getattr(layer, "params_dtype", torch.bfloat16)
 
         # Resolve one block Hadamard Hᵢ per partition, then precompute Rᵢ = Hᵢᵀ
         # for the online inverse input rotation (Hᵢ orthonormal -> Hᵢ⁻¹ = Hᵢᵀ).
+        # Uniformity is detected in fp32 for an exact comparison; the rotation is
+        # then stored in the activation dtype so the per-forward ``.to(x.dtype)``
+        # is a no-op (no copy) in the common case.
         if self.quant_config.hadamard_type == HADAMARD_TYPE_RANDOM:
             mats = layer.hadamard_matrix.data.to(device=device, dtype=torch.float32)
-            R_list = [mats[i].t().contiguous() for i in range(num_partitions)]
+            R_list_fp32 = [mats[i].t().contiguous() for i in range(num_partitions)]
         else:
             # Deterministic Sylvester is shared and symmetric (Hᵀ = H).
             H = deterministic_hadamard_matrix(bs, dtype=torch.float32, device=device)
-            R_list = [H.t().contiguous() for _ in range(num_partitions)]
+            R_list_fp32 = [H.contiguous() for _ in range(num_partitions)]
 
-        # Uniform fast path when every partition shares the same rotation.
-        uniform = all(torch.equal(R_list[0], R) for R in R_list)
+        uniform = all(torch.equal(R_list_fp32[0], R) for R in R_list_fp32)
         layer._block_size = bs
         layer._rotation_uniform = uniform
-        if uniform:
-            layer._hadamard_R = R_list[0]
-            layer._hadamard_R_list = None
-        else:
-            layer._hadamard_R = None
-            # Stash as a stacked buffer + python list of partition row offsets.
-            layer._hadamard_R_list = torch.stack(R_list, dim=0)
-            offsets = []
-            start = 0
-            for psize in partition_sizes:
-                offsets.append((start, start + psize))
-                start += psize
-            layer._partition_offsets = offsets
 
         # Pre-unpack MXFP4 weight to dense bf16 once (preunpack_bf16 runtime).
-        target_dtype = getattr(layer, "params_dtype", torch.bfloat16)
         weight_dense = dequant_packed_mxfp4_weight(
             layer.weight_packed.data,
             layer.weight_scale.data,
@@ -168,13 +152,29 @@ class HadamardMXFP4LinearMethod(LinearMethodBase):
         )
         layer.weight_dense_qdq = Parameter(weight_dense, requires_grad=False)
 
+        if uniform:
+            layer._hadamard_R = R_list_fp32[0].to(target_dtype)
+            layer._hadamard_R_list = None
+            layer._weight_partitions = None
+        else:
+            layer._hadamard_R = None
+            layer._hadamard_R_list = torch.stack(R_list_fp32, dim=0).to(target_dtype)
+            # Pre-slice the dense weight into per-partition contiguous views and
+            # precompute bias row offsets, so the slow path avoids re-slicing the
+            # weight on every forward. Row slices of a row-major 2D tensor are
+            # already contiguous and share storage (no extra memory).
+            offsets = []
+            partitions = []
+            start = 0
+            for psize in partition_sizes:
+                offsets.append((start, start + psize))
+                partitions.append(layer.weight_dense_qdq.data[start:start + psize])
+                start += psize
+            layer._partition_offsets = offsets
+            layer._weight_partitions = partitions
+
         # Drop the now-unused packed storage and the raw Hadamard buffer.
-        layer.weight_packed = Parameter(
-            torch.empty(1, dtype=torch.uint8, device=device), requires_grad=False
-        )
-        layer.weight_scale = Parameter(
-            torch.empty(1, dtype=torch.uint8, device=device), requires_grad=False
-        )
+        clear_packed_storage(layer)
         layer.hadamard_matrix = Parameter(
             torch.empty(1, dtype=torch.float32, device=device), requires_grad=False
         )
@@ -205,36 +205,30 @@ class HadamardMXFP4LinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         # No logging here: this runs inside vLLM's torch.compile graph.
         bs = layer._block_size
-        weight = layer.weight_dense_qdq
-        input_dtype = x.dtype
 
         if layer._rotation_uniform:
-            # Fast path: single rotation + qdq + merged GEMM.
+            # Fast path: single rotation + qdq + merged GEMM. ``_hadamard_R`` is
+            # stored in the activation dtype, so ``.to(x.dtype)`` is a no-op.
             R = layer._hadamard_R.to(dtype=x.dtype)
             xq = self._rotate_qdq(x, R, bs)
-            if xq.dtype != weight.dtype:
-                xq = xq.to(weight.dtype)
-            b = bias.to(weight.dtype) if bias is not None else None
-            output = torch.nn.functional.linear(xq, weight, b)
-            return output.to(input_dtype) if output.dtype != input_dtype else output
+            return dense_linear_stable_dtype(layer.weight_dense_qdq, xq, bias)
 
         # Faithful path: distinct per-partition Hadamards. Process each output
         # partition independently (matching auto-round's separate q/k/v modules):
         #   yᵢ = qdq(x @ Hᵢᵀ) @ Sᵢᵀ
+        # Weight partitions are pre-sliced contiguous views (see load step).
         R_list = layer._hadamard_R_list.to(dtype=x.dtype)
+        partitions = layer._weight_partitions
+        offsets = layer._partition_offsets
         outputs = []
-        for idx, (row_start, row_end) in enumerate(layer._partition_offsets):
-            R = R_list[idx]
-            xq = self._rotate_qdq(x, R, bs)
-            W_part = weight[row_start:row_end]
-            if xq.dtype != W_part.dtype:
-                xq = xq.to(W_part.dtype)
+        for idx, W_part in enumerate(partitions):
+            xq = self._rotate_qdq(x, R_list[idx], bs)
             b_part = None
             if bias is not None:
-                b_part = bias[row_start:row_end].to(W_part.dtype)
-            outputs.append(torch.nn.functional.linear(xq, W_part, b_part))
-        output = torch.cat(outputs, dim=-1)
-        return output.to(input_dtype) if output.dtype != input_dtype else output
+                row_start, row_end = offsets[idx]
+                b_part = bias[row_start:row_end]
+            outputs.append(dense_linear_stable_dtype(W_part, xq, b_part))
+        return torch.cat(outputs, dim=-1)
 
 
 def _hadamard_weight_loader(param, loaded_weight, loaded_shard_id=None, *args, **kwargs):

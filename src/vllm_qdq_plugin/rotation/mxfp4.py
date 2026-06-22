@@ -270,6 +270,37 @@ def _mxfp4_dequant_linear_fallback(
 
 _qdq_backend_logged = False
 
+# Activation-QDQ backend selection for the SpinQuant op. Default "even" (Quark
+# semantics, what SpinQuant checkpoints expect). "triton" selects the
+# triton-kernel-matching rounding (same as the Hadamard path) as an advanced
+# override. Resolved once from VLLM_SPINQUANT_MXFP4_QDQ_BACKEND (legacy
+# AUTO_ROUND_MXFP4_QDQ_BACKEND); the value changes FP4 rounding semantics.
+_QDQ_BACKEND_EVEN = "even"
+_QDQ_BACKEND_TRITON = "triton"
+_resolved_qdq_backend: str | None = None
+
+
+def _resolve_qdq_backend() -> str:
+    global _resolved_qdq_backend
+    if _resolved_qdq_backend is not None:
+        return _resolved_qdq_backend
+    val = (
+        os.getenv("VLLM_SPINQUANT_MXFP4_QDQ_BACKEND")
+        or os.getenv("AUTO_ROUND_MXFP4_QDQ_BACKEND")
+        or ""
+    ).strip().lower()
+    if val in ("", "even", "quark"):
+        backend = _QDQ_BACKEND_EVEN
+    elif val in ("triton", "triton-match", "hadamard"):
+        backend = _QDQ_BACKEND_TRITON
+    else:
+        logger.warning(
+            "Unknown VLLM_SPINQUANT_MXFP4_QDQ_BACKEND=%r; falling back to 'even'.", val
+        )
+        backend = _QDQ_BACKEND_EVEN
+    _resolved_qdq_backend = backend
+    return backend
+
 
 def _log_qdq_backend(name: str) -> None:
     global _qdq_backend_logged
@@ -281,10 +312,14 @@ def _log_qdq_backend(name: str) -> None:
 def _spinquant_mxfp4_act_qdq_impl(x: torch.Tensor, group_size: int) -> torch.Tensor:
     """QDQ the rotated activation to MXFP4 semantics before GEMM.
 
-    Standalone build: only the pure-PyTorch "even" mode backend is bundled.
-    Set ``VLLM_SPINQUANT_MXFP4_QDQ_BACKEND`` (or legacy
-    ``AUTO_ROUND_MXFP4_QDQ_BACKEND``) for forward-compatible overrides.
+    Backend selected by ``VLLM_SPINQUANT_MXFP4_QDQ_BACKEND`` (legacy
+    ``AUTO_ROUND_MXFP4_QDQ_BACKEND``):
+      * ``even`` (default) — Quark "even" mode; what SpinQuant exports expect.
+      * ``triton`` — the triton-kernel-matching rounding (advanced override).
     """
+    if _resolve_qdq_backend() == _QDQ_BACKEND_TRITON:
+        _log_qdq_backend("pytorch (triton-match) [override]")
+        return mxfp4_act_qdq_hadamard(x, group_size)
     _log_qdq_backend("pytorch (even)")
     return mxfp4_act_qdq(x, group_size)
 

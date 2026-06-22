@@ -38,7 +38,8 @@ import torch
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization import register_quantization_config
-from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
+from ._config_base import MXFP4RotationConfigBase, data_type_is_mxfp
 
 logger = init_logger(__name__)
 
@@ -48,7 +49,7 @@ _VALID_HADAMARD_TYPES = {HADAMARD_TYPE_DETERMINISTIC, HADAMARD_TYPE_RANDOM}
 
 
 @register_quantization_config("hadamard_mxfp4")
-class HadamardMXFP4Config(QuantizationConfig):
+class HadamardMXFP4Config(MXFP4RotationConfigBase):
     """Quantization config for QuaRot per-Linear block-Hadamard + MXFP4."""
 
     def __init__(
@@ -78,18 +79,6 @@ class HadamardMXFP4Config(QuantizationConfig):
     @classmethod
     def get_name(cls) -> str:
         return "hadamard_mxfp4"
-
-    @classmethod
-    def get_supported_act_dtypes(cls) -> list[torch.dtype]:
-        return [torch.bfloat16, torch.float16, torch.float32]
-
-    @classmethod
-    def get_min_capability(cls) -> int:
-        return 70  # Volta+
-
-    @staticmethod
-    def get_config_filenames() -> list[str]:
-        return ["config.json"]
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "HadamardMXFP4Config":
@@ -128,8 +117,7 @@ class HadamardMXFP4Config(QuantizationConfig):
         # Do not collide with the SpinQuant config (spinquant_config present).
         if hf_quant_cfg.get("spinquant_config"):
             return None
-        data_type = str(hf_quant_cfg.get("data_type", "")).lower()
-        if "mxfp" in data_type or "mx_fp" in data_type:
+        if data_type_is_mxfp(hf_quant_cfg):
             return "hadamard_mxfp4"
         return None
 
