@@ -173,6 +173,71 @@ def mxfp4_act_qdq(x: torch.Tensor, group_size: int) -> torch.Tensor:
     return x_qdq.to(original_dtype)
 
 
+def mxfp4_act_qdq_hadamard(x: torch.Tensor, group_size: int) -> torch.Tensor:
+    """Pure-PyTorch MXFP4 activation QDQ matching auto-round's QuaRot ``transform``
+    (triton) inference path bit-for-bit.
+
+    Equivalence note:
+        This reproduces ``auto_round.algorithms.transforms.quarot.utils.triton.
+        mxfp4.mxfp4_forward_kernel`` (``quest=False`` branch) — the kernel used by
+        the per-Linear / random Hadamard HF inference path when triton is
+        available (``pre_dequantized_input=True``). Verified against the real
+        forward (cosine ~0.9999995, max abs diff ~6e-4, the residual being the
+        kernel's bf16 ``tl.dot`` rotation vs this fp32 rotation).
+
+        Two details distinguish it from both :func:`mxfp4_act_qdq` (Quark "even")
+        and auto-round's non-triton ``quant_mx``:
+          1. per-group scale = ``2^(floor(log2(amax)) - 2) / 0.75`` (the ``/0.75``
+             expands the dynamic range so amax maps near 3-4 on the FP4 grid);
+          2. round-to-nearest with explicit midpoint thresholds on the E2M1 grid
+             ``{0, 0.5, 1, 1.5, 2, 3, 4, 6}`` (NOT round-half-to-even).
+
+    The Hadamard rotation itself is applied by the caller (the LinearMethod), so
+    this function only does the per-group scale + FP4 round + dequant.
+    """
+    if group_size <= 0 or x.shape[-1] % group_size != 0:
+        raise ValueError(
+            f"MXFP4 activation qdq requires the last dim to be divisible by group_size, "
+            f"got shape={tuple(x.shape)}, group_size={group_size}"
+        )
+
+    original_dtype = x.dtype
+    original_shape = x.shape
+    x_fp32 = x.to(torch.float32).reshape(-1, group_size)
+
+    amax = x_fp32.abs().amax(dim=-1, keepdim=True)
+    safe_max = torch.where(amax == 0, torch.ones_like(amax), amax)
+    # shared_exp = 2^(floor(log2(amax)) - 2) / (3/4)   [matches triton kernel]
+    shared_exp = torch.exp2(torch.floor(torch.log2(safe_max)) - 2.0) / 0.75
+    shared_exp = torch.where(shared_exp > 0, shared_exp, torch.ones_like(shared_exp))
+
+    x_scaled = x_fp32 / shared_exp
+    a = x_scaled.abs()
+    sign = torch.where(x_scaled > 0, 1.0, -1.0)
+    # Round to nearest E2M1 grid point with the kernel's midpoint thresholds.
+    fp4 = torch.where(
+        a > 5.0, 6.0,
+        torch.where(
+            a > 3.5, 4.0,
+            torch.where(
+                a > 2.5, 3.0,
+                torch.where(
+                    a > 1.75, 2.0,
+                    torch.where(
+                        a > 1.25, 1.5,
+                        torch.where(
+                            a > 0.75, 1.0,
+                            torch.where(a > 0.25, 0.5, torch.zeros_like(a)),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    x_qdq = (sign * fp4 * shared_exp).reshape(original_shape)
+    return x_qdq.to(original_dtype)
+
+
 # =============================================================================
 # Optional Triton fused dequant + GEMM
 # =============================================================================
@@ -225,6 +290,20 @@ def _spinquant_mxfp4_act_qdq_impl(x: torch.Tensor, group_size: int) -> torch.Ten
 
 
 def _spinquant_mxfp4_act_qdq_fake(x: torch.Tensor, group_size: int) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+def _hadamard_mxfp4_act_qdq_impl(x: torch.Tensor, group_size: int) -> torch.Tensor:
+    """MXFP4 activation QDQ for the per-Linear Hadamard path.
+
+    Matches auto-round's triton ``mxfp4_forward_kernel`` inference path
+    (see :func:`mxfp4_act_qdq_hadamard`).
+    """
+    _log_qdq_backend("pytorch (hadamard/triton-match)")
+    return mxfp4_act_qdq_hadamard(x, group_size)
+
+
+def _hadamard_mxfp4_act_qdq_fake(x: torch.Tensor, group_size: int) -> torch.Tensor:
     return torch.empty_like(x)
 
 
@@ -294,6 +373,14 @@ def register_custom_ops() -> None:
         op_func=_spinquant_mxfp4_linear_impl,
         mutates_args=[],
         fake_impl=_spinquant_mxfp4_linear_fake,
+        target_lib=lib,
+        dispatch_key=current_platform.dispatch_key,
+    )
+    direct_register_custom_op(
+        op_name="hadamard_mxfp4_act_qdq",
+        op_func=_hadamard_mxfp4_act_qdq_impl,
+        mutates_args=[],
+        fake_impl=_hadamard_mxfp4_act_qdq_fake,
         target_lib=lib,
         dispatch_key=current_platform.dispatch_key,
     )

@@ -92,6 +92,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SPINQUANT_MXFP4_QDQ_BACKEND": lambda: os.getenv(
         "VLLM_SPINQUANT_MXFP4_QDQ_BACKEND", ""
     ),
+    # QuaRot per-Linear (block-diagonal 32x32) Hadamard + MXFP4 inference:
+    # registers the 'hadamard_mxfp4' quantization config when truthy. Targets
+    # auto-round checkpoints saved with rotation_config.hadamard_type in
+    # {hadamard, random_hadamard} (distinct from SpinQuant's spinquant_config).
+    "VLLM_HADAMARD_MXFP4": lambda: _env_flag("VLLM_HADAMARD_MXFP4"),
     "VLLM_MARLIN_MOE_QDQ_MODE": env_with_choices(
         "VLLM_MARLIN_MOE_QDQ_MODE",
         default="0",

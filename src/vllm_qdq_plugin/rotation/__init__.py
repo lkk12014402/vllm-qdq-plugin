@@ -47,13 +47,49 @@ def register_spinquant_mxfp4() -> None:
     )
 
 
+_REGISTERED_HADAMARD = False
+
+
+def register_hadamard_mxfp4() -> None:
+    """Register the ``hadamard_mxfp4`` quantization config (per-Linear block Hadamard).
+
+    Idempotent. Safe to call in every process (main + workers).
+    """
+    global _REGISTERED_HADAMARD
+    if _REGISTERED_HADAMARD:
+        return
+    _REGISTERED_HADAMARD = True
+
+    from .mxfp4 import register_custom_ops
+
+    # Shares the vllm_qdq_plugin.spinquant_mxfp4_act_qdq op with the SpinQuant path.
+    register_custom_ops()
+
+    # Importing config triggers @register_quantization_config("hadamard_mxfp4").
+    from . import perlinear_config  # noqa: F401
+
+    logger.info(
+        "vllm-qdq-plugin: registered 'hadamard_mxfp4' quantization config "
+        "(VLLM_HADAMARD_MXFP4 enabled)"
+    )
+
+
 def __getattr__(name: str):
     # Lazy export to avoid importing vLLM quantization machinery at package import.
     if name == "SpinQuantMXFP4Config":
         from .config import SpinQuantMXFP4Config
 
         return SpinQuantMXFP4Config
+    if name == "HadamardMXFP4Config":
+        from .perlinear_config import HadamardMXFP4Config
+
+        return HadamardMXFP4Config
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-__all__ = ["register_spinquant_mxfp4", "SpinQuantMXFP4Config"]
+__all__ = [
+    "register_spinquant_mxfp4",
+    "register_hadamard_mxfp4",
+    "SpinQuantMXFP4Config",
+    "HadamardMXFP4Config",
+]

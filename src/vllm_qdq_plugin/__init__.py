@@ -56,6 +56,11 @@ def register():
 
         register_spinquant_mxfp4()
 
+    if envs.VLLM_HADAMARD_MXFP4:
+        from .rotation import register_hadamard_mxfp4
+
+        register_hadamard_mxfp4()
+
     if not envs.VLLM_QDQ:
         return
 
